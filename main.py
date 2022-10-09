@@ -10,7 +10,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, balanced_accuracy_score, accuracy_score, precision_score, recall_score
 import wandb
-
+from tqdm.auto import tqdm
 
 def replicate(x, xn):
     while xn.shape[1] <= x.shape[1]:
@@ -21,22 +21,23 @@ def replicate(x, xn):
 
 
 class Loader:
-    def __init__(self, df, noise_df=None, noise_elem=None, sigma=0):
+    def __init__(self, sample_rate, beta, df, noise_df=None, noise_elem=None, sigma=0):
         self.df = df
         self.noise_df = noise_df
         self.sigma = sigma
+        self.beta = beta
+        self.sample_rate = sample_rate
         self.noise_elem = self.f(noise_elem)[0] if noise_elem is not None else None
 
     def __len__(self):
         return len(self.df)
 
-    @staticmethod
-    def f(r):
+    def f(self, r):
         audio, rate = torchaudio.load(f'data/fold{r.fold}/{r.slice_file_name}')
         if audio.shape[0] == 1:
             audio = th.stack([audio[0, :], audio[0, :]], dim=0)
         y = th.tensor(float(r.Label))
-        return Fa.resample(audio, rate, sample_rate), y
+        return Fa.resample(audio, rate, self.sample_rate), y
 
     def __getitem__(self, i):
         assert 0 <= i < len(self)
@@ -47,12 +48,13 @@ class Loader:
             xn, _ = self.f(self.noise_df.sample(n=1).iloc[0])
 
             xn = replicate(x, xn)
-            x = x + beta * xn
+            x = x + self.beta * xn
         if self.noise_elem is not None:
             xn = replicate(x, self.noise_elem)
-            x = x + beta * xn
-        if self.sigma > 0:
-            x = x + self.randn(x.shape) * self.sigma
+            snr = 10**(self.beta/20) * x.norm(2) / xn.norm(2)
+            x = x + snr * xn
+        # if self.sigma > 0:
+        #     x = x + self.randn(x.shape) * self.sigma
         return x, y
 
 
@@ -82,13 +84,14 @@ def collate_fn(batch):
     return tensors, targets
 
 
-def make_loader(df, drop_last=False,
+def make_loader(sample_rate, beta,df, batch_size, drop_last=False,
                 shuffle=False,
                 noise_df=None,
                 noise_elem=None,
+                num_workers=8,
                 sigma=0):
     return utils.data.DataLoader(
-        Loader(df, noise_df, noise_elem, sigma),
+        Loader(sample_rate, beta, df, noise_df, noise_elem, sigma),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
@@ -156,21 +159,22 @@ class M5(nn.Module):
         x = self.pool4(x)
         # x = F.avg_pool1d(x, x.shape[-1])
         # x = x.permute(0, 2, 1)
-        x = th.logsumexp(x, dim=-1) - np.log(x.shape[-1])
+        x = th.logsumexp(x / x.shape[-1], dim=-1)
 
         x = self.dropout(x)
         x = self.fc1(x)
         return x.squeeze()
 
 
-def infer(model, df):
+def infer(model, df, batch_size, sample_rate,):
+    #model_train = model.train()
     res = []
     with th.no_grad():
-        p = model.train()
+        
         model.train(False)
-        for x, y in make_loader(df, drop_last=False, shuffle=False):
+        for x, y in make_loader(sample_rate, 0, df, batch_size, drop_last=False, shuffle=False, noise_df=None, noise_elem=None, sigma=0):
             res.append((model(x.cuda()) >= 0).cpu().numpy())
-        model.train(p)
+        #model.train(model_train)
         return np.concatenate(res)
 
 
@@ -184,10 +188,10 @@ def metrics(y, yh, pre=""):
     }
 
 
-def main(batch_size, num_workers, sample_rate, epochs, negative_sample_rate,
-            sigma, beta, val_rate):
+def main(batch_size, sample_rate, epochs, negative_sample_rate,
+            sigma, beta, val_rate, step_size, step_gamma, train_noise_elem, noise_df):
     wandb.login()
-    wandb.init(project="test-project", entity="all-i-do-is-win",
+    wandb.init(project="real-run", entity="all-i-do-is-win",
                config={
                    'epochs': epochs,
                    'negative_sample_rate': negative_sample_rate,
@@ -195,7 +199,6 @@ def main(batch_size, num_workers, sample_rate, epochs, negative_sample_rate,
                    'sigma': sigma,
                    'val_rate': val_rate,
                    'batch_size': batch_size,
-                   'num_workers': num_workers,
                    'beta': beta,
                })
 
@@ -211,17 +214,22 @@ def main(batch_size, num_workers, sample_rate, epochs, negative_sample_rate,
 
     model = M5().cuda()
     opt = optim.Adam(model.parameters())
+
+    lr_sched = optim.lr_scheduler.StepLR(opt, step_size, gamma=step_gamma)
     wandb.watch(model)
 
     model.train(True)
-    for epoch in range(epochs):
-        print(f'epoch, {epoch}')
+    for epoch in tqdm(range(epochs)):
         local_train_nothing = train_df_nothing.sample(
             min(len(train_df_nothing), len(train_df_gunshot) * negative_sample_rate))
         local_train_df = pd.concat([train_df_gunshot, local_train_nothing]).reset_index()
 
         model.train(True)
-        for x, y in make_loader(local_train_df, shuffle=True, drop_last=True):
+        for x, y in make_loader(sample_rate, beta, local_train_df, batch_size, 
+                shuffle=True, drop_last=True, 
+                noise_elem=df.iloc[train_noise_elem] if train_noise_elem is not None else None,
+                noise_df=df if noise_df else None):
+
             opt.zero_grad()
             y_cpu = y
             x, y = x.cuda(), y.cuda()
@@ -234,19 +242,19 @@ def main(batch_size, num_workers, sample_rate, epochs, negative_sample_rate,
             opt.step()
 
             with th.no_grad():
-                p = logit > 0
-                wandb.log(metrics(y_cpu, (p == y).cpu().numpy()))
+                p = (logit > 0).cpu().numpy()
+                wandb.log(metrics(y_cpu, p))
         if len(val_df) > 0:
             with th.no_grad():
                 vy = val_df.Label == 1
                 vyh = infer(model, val_df)
                 wandb.log(metrics(vy, vyh, pre="val_"))
-
+        lr_sched.step()
     res = test_df.copy()
-    res.Label = infer(model, test_df)
+    res.Label = infer(model, test_df, batch_size*4, sample_rate)
     res.to_csv('submit.csv', index=False)
     wandb.save('submit.csv')
 
 
-main(batch_size=64, num_workers=2, sample_rate=1800, epochs=100, negative_sample_rate=2,
-     sigma=0.00, beta=0.0, val_rate=0.0)
+main(batch_size=64, sample_rate=10000, epochs=200, negative_sample_rate=2,
+     sigma=0.00, beta=3.0, val_rate=0.0, step_size=50, step_gamma=0.5, train_noise_elem=None, noise_df=True)
