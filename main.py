@@ -14,6 +14,7 @@ from sklearn.metrics import f1_score, balanced_accuracy_score, accuracy_score, p
 import wandb
 from tqdm.auto import tqdm
 import argparse
+import tempfile
 
 wandb.login()
 def replicate(x, xn):
@@ -51,9 +52,9 @@ class Loader:
         if random() <= self.coinflip and self.noise_df is not None:
             xn = self.f(self.noise_df.sample(n=1).iloc[0])[0]
             xn = replicate(x, xn)
-            x = x + self.beta * x.norm(2) / xn.norm(2) * xn 
+            x = x + np.random.uniform(self.beta, self.beta) * x.norm(2) / xn.norm(2) * xn 
         if random() <= self.coinflip and self.sigma > 0:
-            x = x + self.randn(x.shape) * self.sigma
+            x = x + self.randn(x.shape) * self.sigma * x.norm(1+1)
         return x, y
 
 
@@ -156,9 +157,9 @@ class M5(nn.Module):
         x = self.conv4(x)
         x = F.relu(self.bn4(x))
         x = self.pool4(x)
-        # x = F.avg_pool1d(x, x.shape[-1])
-        # x = x.permute(0, 2, 1)
-        x = th.logsumexp(x / x.shape[-1], dim=-1)
+        x = F.avg_pool1d(x, x.shape[-1])
+        x = x.permute(0, 2, 1)
+        # x = th.logsumexp(x / x.shape[-1], dim=-1)
 
         x = self.dropout(x)
         x = self.fc1(x)
@@ -187,7 +188,7 @@ def metrics(y, yh, pre=""):
     }
 
 class Clf:
-    def __init__(self, channel, lr, batch_size, sample_rate, epochs, negative_sample_rate, sigma, 
+    def __init__(self, K, channel, lr, batch_size, sample_rate, epochs, negative_sample_rate, sigma, 
         beta, step_size, step_gamma, 
         optimizer,
         noise_df, coinflip, project,
@@ -215,8 +216,9 @@ class Clf:
         self.coinflip = coinflip
         self.noise_df_ = noise_df_
         self.lr = lr
+        self.K = K
         self.channel = channel
-    def fit(self, x, y=None):
+    def fit(self, x, y=None, test_df=None):
 
    
         wandb.init(project=self.project, 
@@ -226,6 +228,7 @@ class Clf:
                     'negative_sample_rate': self.negative_sample_rate,
                     'sample_rate': self.sample_rate,
                     'sigma': self.sigma,
+                    'K': self.K,
                     'batch_size': self.batch_size,
                     'beta': self.beta,
                     'step_size': self.step_size,
@@ -235,10 +238,12 @@ class Clf:
                 })
         self.model = M5(n_channel=self.channel).cuda()
         opt = optim.Adam(self.model.parameters(), lr=self.lr)
+        noise_opt = None
+        noise = None
         lr_sched = optim.lr_scheduler.StepLR(opt, self.step_size, gamma=self.step_gamma)
         wandb.watch(self.model)
-        train_df_gunshot = x[x['Label']]
-        train_df_nothing = x[~x['Label']]
+        train_df_gunshot = x[y]
+        train_df_nothing = x[~y]
 
 
         self.model.train(True)
@@ -255,11 +260,26 @@ class Clf:
                 shuffle=True, drop_last=True, 
                 noise_df=self.noise_df_ if self.noise_df else None,
                 coinflip=self.coinflip):
-
-                opt.zero_grad()
+                if self.K > 0 and (noise is None or noise.shape != x.shape):
+                    noise = th.zeros_like(x, device='cuda')
+                    noise_opt = optim.Adam([noise], lr=self.lr)
                 y_cpu = y
                 x, y = x.cuda(), y.cuda()
 
+                for i in range(self.K):
+                    self.model.zero_grad()
+                    noise_opt.zero_grad()
+                    logit = self.model(x + noise)
+                    loss = -F.binary_cross_entropy_with_logits(logit, y)
+                    loss.backward()
+                    noise_opt.step()
+                    with th.no_grad():
+                        noise.clamp_(-1e-2, 1e-2)
+
+                opt.zero_grad()
+                if noise is not None:
+                    x = x + noise
+                
                 logit = self.model(x)
 
                 loss = F.binary_cross_entropy_with_logits(logit, y)
@@ -271,27 +291,34 @@ class Clf:
                     p = (logit > 0).cpu().numpy()
                     wandb.log(metrics(y_cpu, p))
                 lr_sched.step()
+            if epoch % 10 == 0 and test_df is not None:
+                res = test_df.copy()
+                res.Label = self.pred(test_df)
+                with tempfile.NamedTemporaryFile() as temp:
+                    fn = f'{temp.name}-{epoch}.csv'
+                    res.to_csv(fn, index=False)
+                    wandb.save(fn)
+                    
     def pred(self, x):
         return infer(self.model, x, self.batch_size, self.sample_rate)
 def main(**args):
-    clf = Clf(project="real-run", **args)
-
-
     df = pd.read_csv('data/participant_urbansound8k.csv')
+    clf = Clf(project="real-run", noise_df_=df, **args)
     s = df.Label.isnull()
     train_df = pd.DataFrame(df[~s].reset_index())
     train_df.Label = (train_df.Label == True)
     test_df = df[s].reset_index()
 
-    clf.fit(train_df, train_df.Label)
+    clf.fit(train_df, train_df.Label, test_df=test_df)
 
     res = test_df.copy()
     res.Label = clf.pred(test_df)
-    res.to_csv('submit.csv', index=False)
-    wandb.save('submit.csv')
+    with tempfile.NamedTemporaryFile() as temp:
+        res.to_csv(temp.name+"-final.csv", index=False)
+        wandb.save(temp.name+"-final.csv")
     return wandb
 parser = argparse.ArgumentParser()
-for i in ['batch_size', 'sample_rate', 'epochs', 'negative_sample_rate', 'channel']:
+for i in ['batch_size', 'sample_rate', 'epochs', 'negative_sample_rate', 'channel', 'K']:
     parser.add_argument(f'--{i}', type=int)
 for i in ['lr', 'beta', 'step_size', 'step_gamma', 'sigma', 'coinflip']:
     parser.add_argument(f'--{i}', type=float)

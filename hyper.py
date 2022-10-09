@@ -9,6 +9,7 @@ args = {
     'batch_size': [32, 64, 128, 256, 512],
     'step_size': [50, 100, 200],
     'step_gamma': [0.1, 0.5, 1],
+    'beta': [1.0, 2.0, 0.1, 0.01],
     'sample_rate': [10_000, 20_000, 30_000, 40_000],
     'channel': [32, 48, 16],
     'noise_df': [True, False],
