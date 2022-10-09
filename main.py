@@ -5,13 +5,16 @@ import torch.optim as optim
 import torch.utils as utils
 import torchaudio
 import torchaudio.functional as Fa
+from random import random
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, balanced_accuracy_score, accuracy_score, precision_score, recall_score
 import wandb
 from tqdm.auto import tqdm
+import argparse
 
+wandb.login()
 def replicate(x, xn):
     while xn.shape[1] <= x.shape[1]:
         xn = th.cat([xn, xn], dim=1)
@@ -21,13 +24,13 @@ def replicate(x, xn):
 
 
 class Loader:
-    def __init__(self, sample_rate, beta, df, noise_df=None, noise_elem=None, sigma=0):
+    def __init__(self, sample_rate, beta, df, noise_df, sigma, coinflip):
         self.df = df
         self.noise_df = noise_df
         self.sigma = sigma
         self.beta = beta
+        self.coinflip = coinflip
         self.sample_rate = sample_rate
-        self.noise_elem = self.f(noise_elem)[0] if noise_elem is not None else None
 
     def __len__(self):
         return len(self.df)
@@ -44,17 +47,12 @@ class Loader:
         r = self.df.iloc[i]
         x, y = self.f(r)
 
-        if self.noise_df is not None:
-            xn, _ = self.f(self.noise_df.sample(n=1).iloc[0])
-
+        if random() <= self.coinflip and self.noise_df is not None:
+            xn = self.f(self.noise_df.sample(n=1).iloc[0])[0]
             xn = replicate(x, xn)
-            x = x + self.beta * xn
-        if self.noise_elem is not None:
-            xn = replicate(x, self.noise_elem)
-            snr = 10**(self.beta/20) * x.norm(2) / xn.norm(2)
-            x = x + snr * xn
-        # if self.sigma > 0:
-        #     x = x + self.randn(x.shape) * self.sigma
+            x = x + self.beta * x.norm(2) / xn.norm(2) * xn 
+        if random() <= self.coinflip and self.sigma > 0:
+            x = x + self.randn(x.shape) * self.sigma
         return x, y
 
 
@@ -87,11 +85,11 @@ def collate_fn(batch):
 def make_loader(sample_rate, beta,df, batch_size, drop_last=False,
                 shuffle=False,
                 noise_df=None,
-                noise_elem=None,
                 num_workers=8,
+                coinflip=1.0,
                 sigma=0):
     return utils.data.DataLoader(
-        Loader(sample_rate, beta, df, noise_df, noise_elem, sigma),
+        Loader(sample_rate, beta, df, noise_df, sigma, coinflip=coinflip),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
@@ -172,7 +170,7 @@ def infer(model, df, batch_size, sample_rate,):
     with th.no_grad():
         
         model.train(False)
-        for x, y in make_loader(sample_rate, 0, df, batch_size, drop_last=False, shuffle=False, noise_df=None, noise_elem=None, sigma=0):
+        for x, y in make_loader(sample_rate, 0, df, batch_size, drop_last=False, shuffle=False, noise_df=None, sigma=0):
             res.append((model(x.cuda()) >= 0).cpu().numpy())
         #model.train(model_train)
         return np.concatenate(res)
@@ -187,74 +185,106 @@ def metrics(y, yh, pre=""):
         pre + "recall": recall_score(y, yh),
     }
 
+class Clf:
+    def __init__(self, batch_size, sample_rate, epochs, negative_sample_rate, sigma, 
+        beta, step_size, step_gamma, 
+        noise_df, coinflip, project,
+        noise_df_=None):
+        self.batch_size = batch_size
+        self.sample_rate = sample_rate
+        self.epochs = epochs
+        self.project = project
+        self.negative_sample_rate = negative_sample_rate
+        self.sample_rate = sample_rate
+        self.sigma = sigma
+        self.batch_size = batch_size
+        self.beta = beta
+        self.step_size = step_size
+        self.step_gamma = step_gamma
+        self.noise_df = noise_df
+        self.coinflip = coinflip
+        self.noise_df_ = noise_df_
+    def fit(self, x, y=None):
 
-def main(batch_size, sample_rate, epochs, negative_sample_rate,
-            sigma, beta, val_rate, step_size, step_gamma, train_noise_elem, noise_df):
-    wandb.login()
-    wandb.init(project="real-run", entity="all-i-do-is-win",
-               config={
-                   'epochs': epochs,
-                   'negative_sample_rate': negative_sample_rate,
-                   'sample_rate': sample_rate,
-                   'sigma': sigma,
-                   'val_rate': val_rate,
-                   'batch_size': batch_size,
-                   'beta': beta,
-               })
+   
+        wandb.init(project=self.project, 
+                entity="all-i-do-is-win",
+                config={
+                    'epochs': self.epochs,
+                    'negative_sample_rate': self.negative_sample_rate,
+                    'sample_rate': self.sample_rate,
+                    'sigma': self.sigma,
+                    'batch_size': self.batch_size,
+                    'beta': self.beta,
+                    'step_size': self.step_size,
+                    'step_gamma': self.step_gamma,
+                    'noise_df': self.noise_df,
+                    'coinflip': self.coinflip,
+                })
+        self.model = M5().cuda()
+        opt = optim.Adam(self.model.parameters())
+        lr_sched = optim.lr_scheduler.StepLR(opt, self.step_size, gamma=self.step_gamma)
+        wandb.watch(self.model)
+        train_df_gunshot = x[x['Label']]
+        train_df_nothing = x[~x['Label']]
+
+
+        self.model.train(True)
+        for epoch in tqdm(range(self.epochs)):
+            local_train_nothing = train_df_nothing.sample(
+                min(len(train_df_nothing), 
+                    len(train_df_gunshot) * self.negative_sample_rate))
+            local_train_df = pd.concat([train_df_gunshot, 
+                local_train_nothing]).reset_index()
+
+            self.model.train(True)
+            for x, y in make_loader(self.sample_rate, self.beta, 
+                local_train_df, self.batch_size, 
+                shuffle=True, drop_last=True, 
+                noise_df=self.noise_df_ if self.noise_df else None,
+                coinflip=self.coinflip):
+
+                opt.zero_grad()
+                y_cpu = y
+                x, y = x.cuda(), y.cuda()
+
+                logit = self.model(x)
+
+                loss = F.binary_cross_entropy_with_logits(logit, y)
+                loss.backward()
+                wandb.log({"loss": loss.item()})
+                opt.step()
+
+                with th.no_grad():
+                    p = (logit > 0).cpu().numpy()
+                    wandb.log(metrics(y_cpu, p))
+                lr_sched.step()
+    def pred(self, x):
+        return infer(self.model, x, self.batch_size*4, self.sample_rate)
+def main(**args):
+    clf = Clf(project="real-run", **args)
+
 
     df = pd.read_csv('data/participant_urbansound8k.csv')
     s = df.Label.isnull()
-    train_val_df = pd.DataFrame(df[~s].reset_index())
-    train_val_df.Label = (train_val_df.Label == True)
+    train_df = pd.DataFrame(df[~s].reset_index())
+    train_df.Label = (train_df.Label == True)
     test_df = df[s].reset_index()
 
-    train_df, val_df = train_test_split(train_val_df, train_size=1 - val_rate) if val_rate != 0 else train_val_df, []
-    train_df_gunshot = train_df[train_df['Label']]
-    train_df_nothing = train_df[~train_df['Label']]
+    clf.fit(train_df, train_df.Label)
 
-    model = M5().cuda()
-    opt = optim.Adam(model.parameters())
-
-    lr_sched = optim.lr_scheduler.StepLR(opt, step_size, gamma=step_gamma)
-    wandb.watch(model)
-
-    model.train(True)
-    for epoch in tqdm(range(epochs)):
-        local_train_nothing = train_df_nothing.sample(
-            min(len(train_df_nothing), len(train_df_gunshot) * negative_sample_rate))
-        local_train_df = pd.concat([train_df_gunshot, local_train_nothing]).reset_index()
-
-        model.train(True)
-        for x, y in make_loader(sample_rate, beta, local_train_df, batch_size, 
-                shuffle=True, drop_last=True, 
-                noise_elem=df.iloc[train_noise_elem] if train_noise_elem is not None else None,
-                noise_df=df if noise_df else None):
-
-            opt.zero_grad()
-            y_cpu = y
-            x, y = x.cuda(), y.cuda()
-
-            logit = model(x)
-
-            loss = F.binary_cross_entropy_with_logits(logit, y)
-            loss.backward()
-            wandb.log({"loss": loss.item()})
-            opt.step()
-
-            with th.no_grad():
-                p = (logit > 0).cpu().numpy()
-                wandb.log(metrics(y_cpu, p))
-        if len(val_df) > 0:
-            with th.no_grad():
-                vy = val_df.Label == 1
-                vyh = infer(model, val_df)
-                wandb.log(metrics(vy, vyh, pre="val_"))
-        lr_sched.step()
     res = test_df.copy()
-    res.Label = infer(model, test_df, batch_size*4, sample_rate)
+    res.Label = clf.pred(test_df)
     res.to_csv('submit.csv', index=False)
     wandb.save('submit.csv')
-
-
-main(batch_size=64, sample_rate=10000, epochs=200, negative_sample_rate=2,
-     sigma=0.00, beta=3.0, val_rate=0.0, step_size=50, step_gamma=0.5, train_noise_elem=None, noise_df=True)
+    return wandb
+parser = argparse.ArgumentParser()
+for i in ['batch_size', 'sample_rate', 'epochs', 'negative_sample_rate']:
+    parser.add_argument(f'--{i}', type=int)
+for i in ['beta', 'step_size', 'step_gamma', 'sigma', 'coinflip']:
+    parser.add_argument(f'--{i}', type=float)
+for i in ['noise_df']:
+    parser.add_argument(f'--{i}', type=bool)
+if __name__ == '__main__':
+    args = parser.parse_args()
+    main(**vars(args))
