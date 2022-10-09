@@ -8,6 +8,7 @@ import torchaudio.functional as Fa
 from random import random
 import numpy as np
 import pandas as pd
+from adabelief_pytorch import AdaBelief
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, balanced_accuracy_score, accuracy_score, precision_score, recall_score
 import wandb
@@ -186,8 +187,9 @@ def metrics(y, yh, pre=""):
     }
 
 class Clf:
-    def __init__(self, batch_size, sample_rate, epochs, negative_sample_rate, sigma, 
+    def __init__(self, channel, lr, batch_size, sample_rate, epochs, negative_sample_rate, sigma, 
         beta, step_size, step_gamma, 
+        optimizer,
         noise_df, coinflip, project,
         noise_df_=None):
         self.batch_size = batch_size
@@ -197,6 +199,14 @@ class Clf:
         self.negative_sample_rate = negative_sample_rate
         self.sample_rate = sample_rate
         self.sigma = sigma
+        if optimizer == 'adam':
+            self.optimizer = optim.Adam
+        elif optimizer == 'sgd':
+            self.optimizer = optim.SGD
+        elif optimizer == 'ada':
+            self.optimizer = AdaBelief
+        else:
+            raise " optimizer not known"
         self.batch_size = batch_size
         self.beta = beta
         self.step_size = step_size
@@ -204,6 +214,8 @@ class Clf:
         self.noise_df = noise_df
         self.coinflip = coinflip
         self.noise_df_ = noise_df_
+        self.lr = lr
+        self.channel = channel
     def fit(self, x, y=None):
 
    
@@ -221,8 +233,8 @@ class Clf:
                     'noise_df': self.noise_df,
                     'coinflip': self.coinflip,
                 })
-        self.model = M5().cuda()
-        opt = optim.Adam(self.model.parameters())
+        self.model = M5(n_channel=self.channel).cuda()
+        opt = optim.Adam(self.model.parameters(), lr=self.lr)
         lr_sched = optim.lr_scheduler.StepLR(opt, self.step_size, gamma=self.step_gamma)
         wandb.watch(self.model)
         train_df_gunshot = x[x['Label']]
@@ -279,12 +291,13 @@ def main(**args):
     wandb.save('submit.csv')
     return wandb
 parser = argparse.ArgumentParser()
-for i in ['batch_size', 'sample_rate', 'epochs', 'negative_sample_rate']:
+for i in ['batch_size', 'sample_rate', 'epochs', 'negative_sample_rate', 'channel']:
     parser.add_argument(f'--{i}', type=int)
-for i in ['beta', 'step_size', 'step_gamma', 'sigma', 'coinflip']:
+for i in ['lr', 'beta', 'step_size', 'step_gamma', 'sigma', 'coinflip']:
     parser.add_argument(f'--{i}', type=float)
 for i in ['noise_df']:
     parser.add_argument(f'--{i}', type=bool)
+parser.add_argument("--optimizer")
 if __name__ == '__main__':
     args = parser.parse_args()
     main(**vars(args))

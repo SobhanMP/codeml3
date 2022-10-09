@@ -20,8 +20,9 @@ for train_index, test_index in cv.split(train_df, train_df.Label):
     clf.fit(local_train_df)
     pred = clf.pred(local_test_df)
     f1 = f1_score(local_test_df.Label, pred)
-    s = len(test_index) + total_f1_n
-    total_f1 = total_f1_n / s * total_f1 + len(test_index) / s * f1
+    print(f'f1: {f1}, {total_f1}, {total_f1_n}')
+    s = len(local_test_df) + total_f1_n
+    total_f1 = total_f1_n / s * total_f1 + len(local_test_df) / s * f1
     total_f1_n = s
     wandb.finish()
 clf.project="hyper-run"
@@ -34,4 +35,4 @@ with tempfile.NamedTemporaryFile() as temp:
     wandb.log({
         'test_score': total_f1
     })
-wandb.finish()
+    wandb.finish()

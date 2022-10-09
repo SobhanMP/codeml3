@@ -9,15 +9,18 @@ args = {
     'batch_size': [32, 64, 128, 256, 512],
     'step_size': [50, 100, 200],
     'step_gamma': [0.1, 0.5, 1],
+    'sample_rate': [10_000, 20_000, 30_000, 40_000],
+    'channel': [32, 48, 16],
     'noise_df': [True, False],
     'sigma': [0.0, 0.0, 0.1, 0.5, 1.0, 2.0],
-    'coinflip': [0.0, 0.1, 0.3, 0.5, 1.0]
+    'coinflip': [0.0, 0.1, 0.3, 0.5, 1.0],
+    'optimizer': ['adam', 'sgd', 'ada']
 }
 largs = list(args.items())
 keys = [k for (k, v) in largs]
 values = [v for (k, v) in largs]
 values = list(it.product(*values))
 shuffle(values)
-for vs in values:
+for vs in values[:1000]:
     print(" ".join(f"--{k}={v}"for (k, v) in zip(keys, vs)))
 
