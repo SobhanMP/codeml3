@@ -272,7 +272,7 @@ class Clf:
                     wandb.log(metrics(y_cpu, p))
                 lr_sched.step()
     def pred(self, x):
-        return infer(self.model, x, self.batch_size*4, self.sample_rate)
+        return infer(self.model, x, self.batch_size, self.sample_rate)
 def main(**args):
     clf = Clf(project="real-run", **args)
 
